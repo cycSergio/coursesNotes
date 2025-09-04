@@ -1,0 +1,1 @@
+File System: a set of data structures on disk and within the OS kernel memory to organize persistent data.
