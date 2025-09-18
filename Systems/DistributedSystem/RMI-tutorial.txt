@@ -1,0 +1,12 @@
+
+You need to have at least Java version 8, to do this assignment. All personal PC hardware today can easily run Java 8 or later versions. 
+
+First, read the following regarding some basic background knowledge (if you do not already have) on java packages and classpath.
+
+https://docs.oracle.com/javase/7/docs/technotes/tools/windows/classpath.html
+
+Next, follow the steps in the following tutorial on Java RMI.
+
+https://docs.oracle.com/javase/8/docs/technotes/guides/rmi/hello/hello-world.html
+
+
