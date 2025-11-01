@@ -1,189 +1,321 @@
+"""
+build_dirtycow_provenance_graph_race_clean.py
+
+Features:
+---------
+1) Vertical timeline: nodes are layered by second (top = early, bottom = late).
+2) Race detection: flags processes that issue madvise + write/pwrite within the same second.
+3) Aggregated edge labels: shows per-(proc, file, action) counts (e.g., write×4061).
+4) Security-relevant highlighting: /proc/self/mem and /etc/passwd (root_file) edges and nodes.
+5) Clearer drawing: curved edges, spaced layers, readable labels/legend, hide idle bash nodes.
+
+Env:
+- Python 3.10+
+- pip install networkx matplotlib
+"""
+
 import json
+import random
+from collections import defaultdict, Counter
+from datetime import datetime
 import networkx as nx
 import matplotlib.pyplot as plt
 
-# -----------------------------
-# 1. Initialize Directed Graph
-# -----------------------------
-G = nx.DiGraph()
-
-# -----------------------------
-# 2. Read Auditbeat Log File
-# -----------------------------
 LOG_FILE = "auditbeat-report.log"
 
-with open(LOG_FILE, "r") as f:
-    for line in f:
+# -----------------------------
+# Helpers
+# -----------------------------
+def parse_time(ts: str):
+    """Parse ISO8601 -> naive datetime (strip tz to avoid mixed aware/naive)."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return dt.replace(tzinfo=None)
+    except Exception:
+        return None
+
+def time_bucket(dt: datetime):
+    """Bucket to second precision."""
+    if not dt:
+        return None
+    return dt.replace(microsecond=0)
+
+def wrap_label(text, max_len=16):
+    """Word-wrap long paths for compact node labels."""
+    if not text or len(text) <= max_len:
+        return text
+    if "/" in text:
+        parts = text.split("/")
+        out, line = [], ""
+        for p in parts:
+            if len(line) + len(p) + (1 if line else 0) <= max_len:
+                line = (line + "/" + p) if line else p
+            else:
+                out.append(line)
+                line = p
+        if line:
+            out.append(line)
+        return "\n".join(out)
+    return "\n".join(text[i:i+max_len] for i in range(0, len(text), max_len))
+
+# -----------------------------
+# 1) Ingest & pre-aggregate
+# -----------------------------
+events = []
+with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
+    for ln in f:
+        ln = ln.strip()
+        if not ln:
+            continue
         try:
-            event = json.loads(line.strip())
+            events.append(json.loads(ln))
         except json.JSONDecodeError:
             continue
 
-        # Extract key fields
-        proc = event.get("process", {}).get("name")           # Process name (e.g., dirty_cow)
-        pid = event.get("process", {}).get("pid")             # Process ID
-        file_path = event.get("file", {}).get("path")         # File path (e.g., /etc/passwd)
-        action = event.get("event", {}).get("action")         # Action (e.g., open, write, madvise)
-        timestamp = event.get("@timestamp")                   # Timestamp
+# Sort chronologically
+events.sort(key=lambda e: parse_time(e.get("@timestamp") or ""))
 
-        if not proc or not action:
-            continue
+# Containers
+G = nx.DiGraph()
+proc_syscalls_by_sec = defaultdict(lambda: defaultdict(set))   # proc -> sec -> {actions}
+edge_counters = Counter()                                      # (proc_node, file_path, action) -> count
+parent_links = set()                                           # (parent_node, child_node, timestamp)
+node_time = {}                                                 # node -> earliest timestamp seen
+proc_last_ts = {}                                              # proc_node -> last timestamp
 
-        proc_node = f"{proc}({pid})"
+# Security targets
+TARGET_FILES = {"/etc/passwd", "/etc/shadow"}
+PROC_SELF_MEM = "/proc/self/mem"
 
-        # -----------------------------
-        # 3. Add Process Node
-        # -----------------------------
-        G.add_node(proc_node,
-                   type="process",
-                   label=proc,
-                   timestamp=timestamp)
+for ev in events:
+    ts = ev.get("@timestamp")
+    dt = parse_time(ts)
+    bucket = time_bucket(dt)
 
-        # -----------------------------
-        # 4. Add File Node
-        # -----------------------------
-        if file_path:
-            G.add_node(file_path,
-                       type="file",
-                       label=file_path,
-                       timestamp=timestamp)
-            G.add_edge(proc_node, file_path, label=action, time=timestamp)
+    proc_name = ev.get("process", {}).get("name")
+    pid = ev.get("process", {}).get("pid")
+    action = ev.get("event", {}).get("action")
+    file_path = ev.get("file", {}).get("path")
 
-        # -----------------------------
-        # 5. Capture Process Execution Relationships
-        # -----------------------------
-        if action in ["execve", "execveat"]:
-            parent = proc_node
-            child_exe = event.get("process", {}).get("executable")
-            if child_exe:
-                G.add_node(child_exe, type="process", label=child_exe)
-                G.add_edge(parent, child_exe, label="exec", time=timestamp)
+    if not proc_name or not action:
+        continue
 
-        # -----------------------------
-        # 6. Capture Parent Process Relationships (bash → dirty_cow)
-        # -----------------------------
-        parent_info = event.get("process", {}).get("parent", {})
-        parent_name = parent_info.get("name")
-        parent_pid = parent_info.get("pid")
+    proc_node = f"{proc_name}({pid})"
 
-        # If a parent process exists, connect it with a "spawned" edge
-        if parent_name and parent_pid:
-            parent_node = f"{parent_name}({parent_pid})"
-            G.add_node(parent_node, type="process", label=parent_name)
-            # Add directed edge: parent → current process
-            G.add_edge(parent_node, proc_node, label="spawned", time=timestamp)
+    # Track process node & time
+    if proc_node not in G:
+        G.add_node(proc_node, type="process", label=proc_name)
+    if proc_node not in node_time or (dt and node_time.get(proc_node) and dt < node_time[proc_node]) or node_time.get(proc_node) is None:
+        node_time[proc_node] = dt
+    proc_last_ts[proc_node] = dt or proc_last_ts.get(proc_node)
 
-# -----------------------------
-# 7. Filter Dirty COW Related Nodes
-# -----------------------------
-dirtycow_nodes = [n for n in G.nodes if "dirty" in n or "cow" in n or "passwd" in n or "bash" in n]
-sub_nodes = set()
+    # Race-detection bookkeeping
+    if bucket:
+        proc_syscalls_by_sec[proc_node][bucket].add(action)
 
-for n in dirtycow_nodes:
-    sub_nodes |= nx.descendants(G, n)
-    sub_nodes.add(n)
+    # Parent → child (spawned)
+    parent = ev.get("process", {}).get("parent", {}) or {}
+    if parent.get("name") and parent.get("pid"):
+        parent_node = f"{parent['name']}({parent['pid']})"
+        if parent_node not in G:
+            G.add_node(parent_node, type="process", label=parent["name"])
+        parent_links.add((parent_node, proc_node, dt))
+        if parent_node not in node_time or (dt and node_time.get(parent_node) and dt < node_time[parent_node]) or node_time.get(parent_node) is None:
+            node_time[parent_node] = dt
 
-H = G.subgraph(sub_nodes).copy()
+    # File access aggregation
+    if file_path:
+        if file_path not in G:
+            G.add_node(file_path, type="file", label=file_path)
+        edge_counters[(proc_node, file_path, action)] += 1
 
 # -----------------------------
-# 8. Drawing
+# 2) Race detection (madvise + write/pwrite within same second)
 # -----------------------------
-def wrap_label(text, max_len=15):
-    """Wrap long file paths for better visualization."""
-    if len(text) <= max_len:
-        return text
-    if '/' in text:
-        parts = text.split('/')
-        wrapped = ""
-        line = ""
-        for p in parts:
-            if len(line) + len(p) < max_len:
-                line += p + '/'
-            else:
-                wrapped += line + '\n'
-                line = p + '/'
-        wrapped += line
-        return wrapped.rstrip('/')
+race_procs = set()
+for proc_node, by_sec in proc_syscalls_by_sec.items():
+    for sec, acts in by_sec.items():
+        if "madvise" in acts and (("write" in acts) or ("pwrite" in acts)):
+            race_procs.add(proc_node)
+            break
+
+# -----------------------------
+# 3) Build graph from aggregates
+# -----------------------------
+for (pnode, fpath, act), cnt in edge_counters.items():
+    lbl = f"{act}×{cnt}"
+    tlabel = proc_last_ts.get(pnode)
+    if tlabel:
+        lbl = f"{lbl}\n{tlabel.strftime('%H:%M:%S')}"
+    G.add_edge(pnode, fpath, label=lbl, action=act)
+
+for parent, child, dt in parent_links:
+    lbl = "spawned"
+    if dt:
+        lbl += f"\n{dt.strftime('%H:%M:%S')}"
+    G.add_edge(parent, child, label=lbl, action="spawned")
+
+# -----------------------------
+# 4) Extract Dirty COW–related subgraph
+# -----------------------------
+KEYS = ("dirty", "cow", "passwd", "shadow", "bash", "mem")
+seed_nodes = [n for n in G.nodes if any(k in str(n) for k in KEYS)]
+keep = set()
+for n in seed_nodes:
+    keep.add(n)
+    keep |= nx.descendants(G, n)
+    keep |= nx.ancestors(G, n)
+H = G.subgraph(keep).copy()
+
+# 4.1) Remove isolated bash nodes (visual noise)
+isolated_bash = [n for n in H.nodes() if H.degree(n) == 0 and "bash" in str(n)]
+H.remove_nodes_from(isolated_bash)
+
+# -----------------------------
+# 5) Assign vertical time layers (top = earliest)
+# -----------------------------
+# Ensure each node has a timestamp
+for n in H.nodes:
+    node_time.setdefault(n, None)
+
+pairs = [(n, time_bucket(node_time[n]) if node_time[n] else None) for n in H.nodes]
+pairs.sort(key=lambda t: (t[1] or datetime.min))
+
+layers, current, last_bucket = [], [], None
+for n, b in pairs:
+    if b is None:
+        continue
+    if last_bucket is None or b != last_bucket:
+        if current:
+            layers.append(current)
+        current = [n]
+        last_bucket = b
     else:
-        return '\n'.join([text[i:i+max_len] for i in range(0, len(text), max_len)])
+        current.append(n)
+if current:
+    layers.append(current)
 
-labels = {n: wrap_label(n) for n in H.nodes()}
+unknown = [n for n, b in pairs if b is None]
+if unknown:
+    if layers:
+        layers[0].extend(unknown)
+    else:
+        layers = [unknown]
 
-process_nodes = [n for n, attr in H.nodes(data=True) if attr["type"] == "process"]
-file_nodes = [n for n, attr in H.nodes(data=True) if attr["type"] == "file"]
-other_nodes = [n for n, attr in H.nodes(data=True) if attr["type"] not in ["process", "file"]]
+for i, layer in enumerate(layers):
+    for n in layer:
+        H.nodes[n]["layer"] = i
 
-plt.figure(figsize=(11, 8))
-pos = nx.spring_layout(H, k=0.6, seed=42)
+# Layout: vertical timeline, extra spacing
+pos = nx.multipartite_layout(H, subset_key="layer", align="vertical", scale=6.0)
+
+# Type-based horizontal offset + slight jitter to reduce overlaps
+random.seed(42)
+for n, (x, y) in pos.items():
+    t = H.nodes[n].get("type")
+    jitter = random.uniform(-0.25, 0.25)
+    if t == "process":
+        pos[n] = (x - 0.4 + jitter, y)
+    elif t == "file":
+        pos[n] = (x + 0.4 + jitter, y)
+    else:
+        pos[n] = (x + jitter, y)
+
+# -----------------------------
+# 6) Styling & drawing
+# -----------------------------
+plt.figure(figsize=(12, 11))
 ax = plt.gca()
 
-node_size_process = 800
-node_size_file = 800
-node_size_other = 700
-max_node_size = 800
+process_nodes = [n for n, a in H.nodes(data=True) if a.get("type") == "process"]
+file_nodes    = [n for n, a in H.nodes(data=True) if a.get("type") == "file"]
+other_nodes   = [n for n, a in H.nodes(data=True) if a.get("type") not in ("process", "file")]
 
-# Draw edges first
-nx.draw_networkx_edges(H, pos,
-                       ax=ax,
-                       arrows=True,
-                       arrowsize=18,
-                       arrowstyle='->',
-                       edge_color="#555555",
-                       width=1.8,
-                       alpha=0.85,
-                       node_size=int(max_node_size * 1.5))
+# File colors
+file_colors = {}
+for n in file_nodes:
+    lbl = str(n)
+    if lbl in TARGET_FILES:
+        file_colors[n] = "#FFD166"  # highlight passwd/shadow
+    elif lbl == PROC_SELF_MEM:
+        file_colors[n] = "#B7E4C7"  # highlight /proc/self/mem
+    else:
+        file_colors[n] = "#D2EBBE"
 
-# Draw process nodes
-nx.draw_networkx_nodes(H, pos,
-                       ax=ax,
-                       nodelist=process_nodes,
-                       node_color="#E1AFBE",
-                       node_shape='o',
-                       node_size=node_size_process,
-                       alpha=0.85,
-                       label="Process")
+# Process colors (race candidates red)
+proc_colors = {n: ("#FF9999" if n in race_procs else "#E1AFBE") for n in process_nodes}
 
-# Draw file nodes
-nx.draw_networkx_nodes(H, pos,
-                       ax=ax,
-                       nodelist=file_nodes,
-                       node_color="#D2EBBE",
-                       node_shape='s',
-                       node_size=node_size_file,
-                       alpha=0.85,
-                       label="File")
+# Edges
+for u, v, d in H.edges(data=True):
+    act = d.get("action", "")
+    is_hot = act in ("write", "pwrite", "madvise")
+    color  = "#FF5733" if is_hot else "#6E6E6E"
+    width  = 2.6 if is_hot else 1.5
+    rad    = 0.28 if is_hot else -0.18
+    nx.draw_networkx_edges(
+        H, pos,
+        edgelist=[(u, v)],
+        arrows=True,
+        arrowsize=16,
+        arrowstyle="-|>",
+        width=width,
+        edge_color=color,
+        alpha=0.92 if is_hot else 0.78,
+        connectionstyle=f"arc3,rad={rad}",
+    )
 
-# Draw other nodes
-nx.draw_networkx_nodes(H, pos,
-                       ax=ax,
-                       nodelist=other_nodes,
-                       node_color="#AAAAAA",
-                       node_shape='D',
-                       node_size=node_size_other,
-                       alpha=0.75,
-                       label="Other")
+# Nodes
+nx.draw_networkx_nodes(H, pos, nodelist=process_nodes,
+                       node_color=[proc_colors[n] for n in process_nodes],
+                       node_shape="o", node_size=1150, alpha=0.95, label="Process")
 
+nx.draw_networkx_nodes(H, pos, nodelist=file_nodes,
+                       node_color=[file_colors[n] for n in file_nodes],
+                       node_shape="s", node_size=1150, alpha=0.9, label="File")
 
-nx.draw_networkx_labels(H, pos, labels=labels, font_size=7, verticalalignment='center')
-edge_labels = nx.get_edge_attributes(H, "label")
-nx.draw_networkx_edge_labels(H, pos, edge_labels=edge_labels, font_size=7, font_color="gray")
+if other_nodes:
+    nx.draw_networkx_nodes(H, pos, nodelist=other_nodes,
+                           node_color="#AAAAAA", node_shape="D",
+                           node_size=950, alpha=0.8, label="Other")
 
+# Labels
+labels = {n: wrap_label(n) for n in H.nodes()}
+nx.draw_networkx_labels(H, pos, labels=labels, font_size=8,
+                        verticalalignment="center", horizontalalignment="center")
 
-plt.title("Provenance Graph of Dirty COW Attack", fontsize=12)
-plt.legend(scatterpoints=1,
-           loc="upper left",
-           bbox_to_anchor=(0.0, 1.05),
-           fontsize=9,
-           frameon=True)
+# Edge labels (counts + time snippet)
+nx.draw_networkx_edge_labels(
+    H, pos,
+    edge_labels=nx.get_edge_attributes(H, "label"),
+    font_size=7, font_color="gray"
+)
 
+# Legend
+legend_text = [
+    "Process (red = possible race: madvise + write/pwrite in same second)",
+    "File: yellow = /etc/passwd or /etc/shadow, green = /proc/self/mem",
+    "Red edges = write / pwrite / madvise (aggregated)"
+]
+for i, txt in enumerate(legend_text):
+    plt.text(0.02, 0.985 - i*0.03, txt, transform=plt.gcf().transFigure,
+             fontsize=9, va="top", ha="left",
+             bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", alpha=0.9))
+
+# plt.title("Dirty COW Provenance Graph (Vertical Timeline, Aggregated & Highlighted)", fontsize=13)
 plt.axis("off")
 plt.tight_layout()
-plt.subplots_adjust(top=0.9)
-plt.savefig("provenance_graph_shapes.png", dpi=300)
+plt.savefig("provenance_graph_timestamp_race_vertical.png", dpi=300)
 plt.show()
 
 # -----------------------------
-# 9. Log Summary
+# 7) Console summary
 # -----------------------------
-print(f"[INFO] Graph built successfully with {len(H.nodes())} nodes and {len(H.edges())} edges.")
-print("[INFO] Parent-child process relationships (bash → dirty_cow) are now included.")
+print(f"[INFO] Nodes: {len(H.nodes())}, Edges: {len(H.edges())}")
+print(f"[INFO] Removed isolated bash nodes: {len(isolated_bash)}")
+print(f"[INFO] Race-candidate processes: {len(race_procs)}")
+if race_procs:
+    for p in sorted(race_procs):
+        print("  -", p)
+print("[INFO] Output: provenance_graph_timestamp_race_vertical.png")
